@@ -1,25 +1,27 @@
 # Dockerfile
 FROM python:3.11-slim
 
-ENV PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
-
-# System deps (runtime + tesseract). Keep lean with --no-install-recommends
+# System dependencies for OpenCV and Tesseract
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
-    libglib2.0-0 \
     libgl1 \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Upgrade pip first, then install Python deps
+# Python deps
 COPY requirements.txt .
 RUN python -m pip install --upgrade pip setuptools wheel \
- && pip install --no-cache-dir -r requirements.txt
+    && pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of your app
+# App code
 COPY . .
 
-# Example entrypoint (adjust to your app)
-# CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+# Helpful envs
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
+
+# Render (and many PaaS) provide $PORT.
+# Use shell form so $PORT is expanded at runtime.
+CMD ["sh", "-c", "streamlit run app.py --server.port $PORT --server.address 0.0.0.0"]
