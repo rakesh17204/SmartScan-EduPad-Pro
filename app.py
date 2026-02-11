@@ -1,181 +1,232 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import logging
-from PIL import Image
 import io
+import time
+from typing import Dict, List, Tuple
+import numpy as np
+import pandas as pd
+import streamlit as st
+from PIL import Image
+import cv2
 
-# Set up comprehensive logging for debugging and performance tracking
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("omr_detection.log"),
-        logging.StreamHandler()
-    ]
-)
+# -----------------------------
+# Helpers
+# -----------------------------
+def init_state():
+    defaults = {
+        "answer_key_bytes": None,         # store bytes, not UploadedFile
+        "student_papers_bytes": [],       # list[bytes]
+        "results": None,                  # pandas DataFrame or None
+        "debug_msgs": [],                 # debug log strings
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-# Initialize session state
-if 'answer_key_image' not in st.session_state:
-    st.session_state.answer_key_image = None
-if 'student_papers' not in st.session_state:
-    st.session_state.student_papers = []
-if 'results' not in st.session_state:
-    st.session_state.results = pd.DataFrame()
+def log(msg: str):
+    st.session_state.debug_msgs.append(msg)
 
-# Constants
-passing_score = 60  # Minimum passing score in percentage
-
-# ============================================
-# 🖼️ IMAGE UPLOAD SECTION
-# ============================================
-st.title("📄 OMR Answer Sheet Scanner & Grading System")
-
-st.markdown("""
-### 📌 Instructions:
-1. Upload the **Answer Key** image.
-2. Upload one or more **Student Answer Sheets**.
-3. Click **"🔬 Start Comparison"** to process and grade.
-""")
-
-# Answer Key Upload
-st.subheader("🔑 Upload Answer Key")
-uploaded_key = st.file_uploader(
-    "Choose answer key image (JPG/PNG)",
-    type=["jpg", "jpeg", "png"],
-    accept_multiple_files=False
-)
-
-if uploaded_key:
+def uploaded_file_to_bytes(uf) -> bytes:
+    """Safely read UploadedFile to raw bytes (seek to start before reading)."""
+    if uf is None:
+        return None
     try:
-        image = Image.open(uploaded_key).convert("RGB")
-        st.session_state.answer_key_image = image
-        st.image(image, caption="Uploaded Answer Key", use_column_width=True)
-        st.success("✅ Answer key loaded successfully.")
-    except Exception as e:
-        st.error(f"❌ Failed to load answer key: {str(e)}")
-        logging.error(f"Image loading failed: {str(e)}")
+        uf.seek(0)
+    except Exception:
+        pass
+    return uf.read()
 
-# Student Papers Upload
-st.subheader("🎓 Upload Student Answer Sheets")
-uploaded_papers = st.file_uploader(
-    "Upload student answer sheets (JPG/PNG)",
-    type=["jpg", "jpeg", "png"],
-    accept_multiple_files=True
-)
+def bytes_to_cv2_image(b: bytes):
+    """Decode bytes -> OpenCV BGR image."""
+    if b is None:
+        return None
+    arr = np.frombuffer(b, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    return img
 
-if uploaded_papers:
-    valid_papers = []
-    for file in uploaded_papers:
-        try:
-            image = Image.open(file).convert("RGB")
-            valid_papers.append(image)
-            st.image(image, caption=f"Uploaded: {file.name}", use_column_width=True)
-        except Exception as e:
-            st.warning(f"⚠️ Skipped invalid file: {file.name} — {str(e)}")
-            logging.warning(f"Invalid file skipped: {file.name} — {str(e)}")
+def bytes_to_pil_image(b: bytes):
+    """Decode bytes -> PIL image (if you prefer PIL)."""
+    if b is None:
+        return None
+    return Image.open(io.BytesIO(b)).convert("RGB")
 
-    if valid_papers:
-        st.session_state.student_papers = valid_papers
-        st.success(f"✅ Successfully loaded {len(valid_papers)} student papers.")
-    else:
-        st.warning("⚠️ No valid student papers were uploaded.")
+# -----------------------------
+# OMR detection adapter
+# -----------------------------
+# EXPECTED CONTRACT:
+# omr_detect_answers(image, debug=False) -> Dict[int, str]
+# returns mapping {question_index: "A"/"B"/"C"/"D"} (or whatever your schema is)
+# IMPORTANT: Replace the stub below with your actual OMR function.
+def omr_detect_answers(img_bgr, debug=False) -> Dict[int, str]:
+    """
+    Replace with your real OMR function.
+    Return {} on failure to allow upstream error handling.
+    """
+    # Example stub: returns empty dict (forces visible error if not replaced)
+    return {}
 
-# ============================================
-# 🔬 START COMPARISON
-# ============================================
-if st.button("🔬 Start Comparison", use_container_width=True):
+# -----------------------------
+# Grading logic
+# -----------------------------
+def grade_student(key: Dict[int, str], stu: Dict[int, str]) -> Tuple[int, int, int, int, float]:
+    """
+    Returns: correct, wrong, blank, total, accuracy
+    """
+    if not key:
+        return 0, 0, 0, 0, 0.0
 
-    # ✅ 1. Validate Answer Key
-    if not st.session_state.answer_key_image:
-        st.error("❌ Please upload an answer key image before starting.")
-        st.stop()
+    total = len(key)
+    correct = 0
+    wrong = 0
+    blank = 0
 
-    # ✅ 2. Validate Student Papers
-    if not st.session_state.student_papers or len(st.session_state.student_papers) == 0:
-        st.error("❌ Please upload at least one valid student answer sheet.")
-        st.stop()
+    for q, ans in key.items():
+        stu_ans = stu.get(q, None)
+        if stu_ans is None or stu_ans == "":
+            blank += 1
+        elif stu_ans == ans:
+            correct += 1
+        else:
+            wrong += 1
 
-    # ✅ 3. Memory & Resource Check (Optional Performance Monitoring)
-    try:
-        import psutil
-        memory_usage = psutil.virtual_memory().percent
-        cpu_usage = psutil.cpu_percent(interval=1)
-        if memory_usage > 85 or cpu_usage > 90:
-            st.warning(f"⚠️ High system resource usage detected: RAM={memory_usage:.1f}%, CPU={cpu_usage:.1f}%")
-            logging.warning(f"High resource usage: RAM={memory_usage:.1f}%, CPU={cpu_usage:.1f}%")
-    except ImportError:
-        logging.info("psutil not available; skipping resource monitoring.")
+    accuracy = (correct / total) * 100 if total > 0 else 0.0
+    return correct, wrong, blank, total, accuracy
 
-    with st.spinner("🔄 Running OMR Detection..."):
+# -----------------------------
+# UI
+# -----------------------------
+st.set_page_config(page_title="OMR Answer Sheet Scanner & Grading System", layout="centered")
+init_state()
 
-        try:
-            # Detect answers from answer key
-            key_answers = omr_detect_answers(st.session_state.answer_key_image, debug=True)
-            st.subheader("🔍 OMR Detection (Answer Key)")
-            st.json(key_answers)
-            logging.info("Successfully detected answers from answer key.")
+st.markdown("## 📝 OMR Answer Sheet Scanner & Grading System")
 
-        except Exception as e:
-            st.error(f"❌ Error detecting answers from answer key: {str(e)}")
-            logging.error(f"Critical error in answer key processing: {str(e)}")
-            st.stop()
-
-        results = []
-
-        # Process each student paper
-        for i, paper in enumerate(st.session_state.student_papers):
-            try:
-                student_answers = omr_detect_answers(paper, debug=True)
-                st.subheader(f"🧪 OMR Detection (Student {i + 1})")
-                st.json(student_answers)
-
-                # Calculate score
-                score = calculate_score(key_answers, student_answers)
-                confidence = np.random.uniform(85, 99)  # Simulated AI confidence
-
-                results.append({
-                    "Student ID": f"STU{i + 1:03d}",
-                    "Score (%)": score,
-                    "AI Confidence (%)": f"{confidence:.1f}%",
-                    "Status": "PASS" if score >= passing_score else "FAIL"
-                })
-
-                logging.info(f"Processed student {i+1}: Score={score}%, Confidence={confidence:.1f}%")
-
-            except Exception as e:
-                st.error(f"❌ Error processing student {i + 1}: {str(e)}")
-                logging.error(f"Failed to process student {i + 1}: {str(e)}")
-                continue  # Skip to next student
-
-        # Store results
-        st.session_state.results = pd.DataFrame(results)
-        st.success("✅ OMR Comparison Complete! Results below.")
-
-# ============================================
-# 📊 RESULTS DISPLAY
-# ============================================
-if not st.session_state.results.empty:
-    st.subheader("📊 Final Results Summary")
-    st.dataframe(st.session_state.results.style.highlight_max(axis=0, color='lightgreen').highlight_min(axis=0, color='lightcoral'), use_container_width=True)
-
-    # Downloadable CSV
-    csv = st.session_state.results.to_csv(index=False).encode('utf-8')
-    st.download_button(
-        label="📥 Download Results as CSV",
-        data=csv,
-        file_name="omr_results.csv",
-        mime="text/csv",
-        use_container_width=True
+with st.expander("Instructions", expanded=False):
+    st.markdown(
+        "- Upload the Answer Key image (JPG/PNG)\n"
+        "- Upload one or more Student Answer Sheets\n"
+        "- Click “Start Comparison”"
     )
 
+# ---- Uploads
+st.markdown("### 🔑 Upload Answer Key")
+answer_key_upload = st.file_uploader(
+    "Choose answer key image (JPG/PNG)",
+    type=["jpg", "jpeg", "png"],
+    key="answer_key_uploader",
+)
+
+if answer_key_upload is not None:
+    st.session_state.answer_key_bytes = uploaded_file_to_bytes(answer_key_upload)
+
+st.markdown("### 🎓 Upload Student Answer Sheets")
+student_uploads = st.file_uploader(
+    "Upload student answer sheets (JPG/PNG)",
+    type=["jpg", "jpeg", "png"],
+    accept_multiple_files=True,
+    key="student_uploader",
+)
+
+if student_uploads:
+    # Overwrite with the fresh list of bytes every rerun
+    st.session_state.student_papers_bytes = [uploaded_file_to_bytes(f) for f in student_uploads]
+
+# ---- Quick status (counts)
+num_students = len(st.session_state.student_papers_bytes or [])
+key_present = st.session_state.answer_key_bytes is not None
+
+col1, col2 = st.columns(2)
+with col1:
+    st.metric("Answer Key Uploaded", "Yes" if key_present else "No")
+with col2:
+    st.metric("Student Sheets Uploaded", str(num_students))
+
+# ---- Actions
+colA, colB = st.columns([2, 1])
+with colA:
+    start = st.button("🚦 Start Comparison", use_container_width=True)
+with colB:
+    if st.button("♻️ Reset", use_container_width=True):
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        st.experimental_rerun()
+
+# ---- Processing
+if start:
+    st.session_state.debug_msgs = []  # reset debug log
+    if not key_present:
+        st.error("Please upload the Answer Key image first.")
+        st.stop()
+    if num_students == 0:
+        st.error("Please upload at least one Student Answer Sheet.")
+        st.stop()
+
+    log(f"Answer key bytes: {len(st.session_state.answer_key_bytes)}")
+    log(f"Student papers count: {num_students}")
+
+    with st.spinner("Running OMR detection..."):
+        # Decode images
+        key_img = bytes_to_cv2_image(st.session_state.answer_key_bytes)
+        if key_img is None:
+            st.error("Failed to decode the Answer Key image. Check the file format.")
+            st.stop()
+
+        key_answers = omr_detect_answers(key_img, debug=True)
+        log(f"Key answers detected: {len(key_answers)}")
+
+        if not key_answers:
+            st.error("Failed to detect answers in the Answer Key. Please check alignment/quality.")
+            st.stop()
+
+        results_rows: List[dict] = []
+        for i, b in enumerate(st.session_state.student_papers_bytes):
+            stu_img = bytes_to_cv2_image(b)
+            if stu_img is None:
+                log(f"Student {i+1}: decode failed.")
+                continue
+
+            stu_answers = omr_detect_answers(stu_img, debug=True)
+            if not stu_answers:
+                log(f"Student {i+1}: OMR detection returned empty.")
+                continue
+
+            correct, wrong, blank, total, acc = grade_student(key_answers, stu_answers)
+
+            results_rows.append({
+                "Student": f"Student {i+1}",
+                "Total Qs": total,
+                "Correct": correct,
+                "Wrong": wrong,
+                "Blank": blank,
+                "Score": correct,          # adjust if there is negative marking
+                "Accuracy (%)": round(acc, 2),
+            })
+
+        if not results_rows:
+            st.error("No valid student results. Check uploads or OMR detection.")
+            st.session_state.results = pd.DataFrame()  # keep consistent type
+        else:
+            st.session_state.results = pd.DataFrame(results_rows)
+
+# ---- Results display
+st.markdown("---")
+st.markdown("### 📊 Results")
+
+if st.session_state.results is not None and not getattr(st.session_state.results, "empty", True):
+    st.dataframe(st.session_state.results, use_container_width=True, hide_index=True)
+    csv_bytes = st.session_state.results.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇️ Download CSV",
+        data=csv_bytes,
+        file_name="omr_results.csv",
+        mime="text/csv",
+    )
 else:
-    st.info("📝 No results to display yet. Upload files and click 'Start Comparison'.")
+    st.info("No results to display yet. Upload files and click ‘Start Comparison’.")
 
-# ============================================
-# 🛠️ DEBUG INFO (Hidden unless needed)
-# ============================================
-if st.checkbox("🔧 Show Debug Info"):
-    st.write("### 🧩 Session State Overview")
-    st.write(st.session_state)
-
+# ---- Optional debug
+with st.expander("🧪 Debug Info"):
+    st.write({
+        "answer_key_present": key_present,
+        "student_papers_count": num_students,
+        "results_shape": None if st.session_state.results is None else st.session_state.results.shape,
+    })
+    if st.session_state.debug_msgs:
+        st.code("\n".join(st.session_state.debug_msgs))
